@@ -1,4 +1,4 @@
-name: Build APK dari ZIP
+name: Build Manga Translator APK
 
 on:
   push:
@@ -8,29 +8,6 @@ jobs:
   build-apk:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Ekstrak ZIP dan Perbaiki Manifest Otomatis
-        run: |
-          mkdir -p _build_dir
-          cp *.zip _build_dir/
-          cd _build_dir
-          for z in *.zip; do
-            unzip -q -o "$z"
-            rm -f "$z"
-          done
-          python3 -c 'import glob, re
-          for p in glob.glob("**/AndroidManifest.xml", recursive=True):
-              t = open(p).read()
-              if "xmlns:tools=" not in t:
-                  t = t.replace("schemas.android.com/apk/res/android\"", "schemas.android.com/apk/res/android\" xmlns:tools=\"http://schemas.android.com/tools\"")
-              t = re.sub(r"<meta-data[^>]*com\.google\.mlkit\.vision\.DEPENDENCIES[^>]*/>", "", t, flags=re.DOTALL)
-              m = "<meta-data android:name=\"com.google.mlkit.vision.DEPENDENCIES\" android:value=\"ocr,ocr_japanese,ocr_korean\" tools:replace=\"android:value\" /></application>"
-              t = t.replace("</application>", m)
-              open(p, "w").write(t)
-          '
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -42,17 +19,400 @@ jobs:
         with:
           gradle-version: "8.7"
 
-      - name: Rakit Debug APK
+      - name: Buat Kode Bersih dan Rakit APK
         run: |
-          cd _build_dir
-          SETTINGS_FILE=$(find . -maxdepth 3 -name "settings.gradle*" | head -n 1)
-          cd "$(dirname "$SETTINGS_FILE")"
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
-          gradle assembleDebug --no-daemon --stacktrace
+          rm -rf _fresh_app
+          mkdir -p _fresh_app/app/src/main/java/com/example/mangatranslator
+          cd _fresh_app
 
-      - name: Upload APK Siap Install
-        uses: actions/upload-artifact@v4
-        with:
-          name: MangaTranslator-APK
-          path: _build_dir/**/build/outputs/apk/debug/*.apk
-          
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MangaScreenTranslator"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.mangatranslator"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.mangatranslator"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+          dependencies {
+              implementation("com.google.android.gms:play-services-tasks:18.2.0")
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
+              implementation("com.google.mlkit:text-recognition-korean:16.0.1")
+              implementation("com.google.mlkit:translate:17.0.3")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:label="Manga Translator"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ScreenTranslatorService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/mangatranslator/MainActivity.kt
+          package com.example.mangatranslator
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+          import com.google.mlkit.nl.translate.TranslateLanguage
+
+          class MainActivity : Activity() {
+              private var selectedLangCode = TranslateLanguage.JAPANESE
+
+              companion object {
+                  private const val REQ_OVERLAY = 101
+                  private const val REQ_CAPTURE = 102
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val rootLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(64, 96, 64, 64)
+                  }
+                  val titleText = TextView(this).apply {
+                      text = "Manga & Manhwa Screen Translator"
+                      textSize = 22f
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 24)
+                  }
+                  val descText = TextView(this).apply {
+                      text = "Pilih bahasa asli komik yang ingin dibaca. Hasil terjemahan Bahasa Indonesia akan langsung menimpa balon komik di layar."
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 48)
+                  }
+                  val langNames = arrayOf(
+                      "Jepang (Manga) -> Indonesia",
+                      "Korea (Manhwa/Webtoon) -> Indonesia",
+                      "Inggris (Comic) -> Indonesia"
+                  )
+                  val langCodes = arrayOf(
+                      TranslateLanguage.JAPANESE,
+                      TranslateLanguage.KOREAN,
+                      TranslateLanguage.ENGLISH
+                  )
+                  val spinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, langNames)
+                      onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                          override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                              selectedLangCode = langCodes[pos]
+                          }
+                          override fun onNothingSelected(parent: AdapterView<*>?) {}
+                      }
+                  }
+                  val btnStart = Button(this).apply {
+                      text = "Aktifkan Tombol Penerjemah Layar"
+                      setBackgroundColor(Color.parseColor("#1E88E5"))
+                      setTextColor(Color.WHITE)
+                      setPadding(32, 32, 32, 32)
+                      setOnClickListener { checkOverlayAndStart() }
+                  }
+                  val btnStop = Button(this).apply {
+                      text = "Matikan Penerjemah"
+                      setOnClickListener {
+                          stopService(Intent(this@MainActivity, ScreenTranslatorService::class.java))
+                          Toast.makeText(this@MainActivity, "Penerjemah dimatikan", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  rootLayout.addView(titleText)
+                  rootLayout.addView(descText)
+                  rootLayout.addView(spinner)
+                  rootLayout.addView(Space(this).apply { minimumHeight = 48 })
+                  rootLayout.addView(btnStart)
+                  rootLayout.addView(Space(this).apply { minimumHeight = 24 })
+                  rootLayout.addView(btnStop)
+                  setContentView(rootLayout)
+              }
+
+              private fun checkOverlayAndStart() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      startActivityForResult(intent, REQ_OVERLAY)
+                  } else {
+                      requestScreenCapturePermission()
+                  }
+              }
+
+              private fun requestScreenCapturePermission() {
+                  val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  startActivityForResult(pm.createScreenCaptureIntent(), REQ_CAPTURE)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_OVERLAY) {
+                      if (Settings.canDrawOverlays(this)) requestScreenCapturePermission()
+                      else Toast.makeText(this, "Izin Overlay wajib diaktifkan!", Toast.LENGTH_LONG).show()
+                  } else if (requestCode == REQ_CAPTURE) {
+                      if (resultCode == Activity.RESULT_OK && data != null) startTranslatorService(resultCode, data)
+                      else Toast.makeText(this, "Izin tangkap layar dibatalkan.", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun startTranslatorService(resultCode: Int, data: Intent) {
+                  val s = Intent(this, ScreenTranslatorService::class.java).apply {
+                      putExtra(ScreenTranslatorService.EXTRA_RESULT_CODE, resultCode)
+                      putExtra(ScreenTranslatorService.EXTRA_RESULT_INTENT, data)
+                      putExtra(ScreenTranslatorService.EXTRA_SOURCE_LANG, selectedLangCode)
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(s) else startService(s)
+                  moveTaskToBack(true)
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/mangatranslator/ScreenTranslatorService.kt
+          package com.example.mangatranslator
+
+          import android.annotation.SuppressLint
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.util.DisplayMetrics
+          import android.util.TypedValue
+          import android.view.*
+          import android.widget.*
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.nl.translate.*
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.TextRecognizer
+          import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
+          import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
+          class ScreenTranslatorService : Service() {
+              private lateinit var windowManager: WindowManager
+              private var floatingButtonView: View? = null
+              private var overlayCanvasLayout: FrameLayout? = null
+              private var mediaProjection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var imageReader: ImageReader? = null
+              private var screenWidth = 0
+              private var screenHeight = 0
+              private var screenDensity = 0
+              private var sourceLangCode: String = TranslateLanguage.JAPANESE
+              private var textRecognizer: TextRecognizer? = null
+              private var translator: Translator? = null
+              private val mainHandler = Handler(Looper.getMainLooper())
+
+              companion object {
+                  const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
+                  const val EXTRA_RESULT_INTENT = "EXTRA_RESULT_INTENT"
+                  const val EXTRA_SOURCE_LANG = "EXTRA_SOURCE_LANG"
+                  private const val NOTIFICATION_ID = 1001
+                  private const val CHANNEL_ID = "manga_translator_channel"
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val metrics = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  windowManager.defaultDisplay.getRealMetrics(metrics)
+                  screenWidth = metrics.widthPixels
+                  screenHeight = metrics.heightPixels
+                  screenDensity = metrics.densityDpi
+                  setupOverlayCanvas()
+                  setupFloatingButton()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startForegroundNotification()
+                  if (intent != null) {
+                      val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                      val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                          intent.getParcelableExtra(EXTRA_RESULT_INTENT, Intent::class.java)
+                      } else {
+                          @Suppress("DEPRECATION")
+                          intent.getParcelableExtra(EXTRA_RESULT_INTENT)
+                      }
+                      sourceLangCode = intent.getStringExtra(EXTRA_SOURCE_LANG) ?: TranslateLanguage.JAPANESE
+                      setupOcrAndTranslator(sourceLangCode)
+                      if (resultData != null && mediaProjection == null) {
+                          initMediaProjection(resultCode, resultData)
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun startForegroundNotification() {
+                  val channel = NotificationChannel(CHANNEL_ID, "Layanan Penerjemah Manga", NotificationManager.IMPORTANCE_LOW)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  val notification = Notification.Builder(this, CHANNEL_ID)
+                      .setContentTitle("Manga Screen Translator Aktif")
+                      .setContentText("Tekan tombol mengambang Terjemahkan saat membaca komik")
+                      .setSmallIcon(android.R.drawable.ic_menu_sort_alphabetically)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(NOTIFICATION_ID, notification)
+                  }
+              }
+
+              private fun setupOcrAndTranslator(langCode: String) {
+                  textRecognizer?.close()
+                  translator?.close()
+                  textRecognizer = when (langCode) {
+                      TranslateLanguage.JAPANESE -> TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
+                      TranslateLanguage.KOREAN -> TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+                      else -> TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                  }
+                  val options = TranslatorOptions.Builder()
+                      .setSourceLanguage(langCode)
+                      .setTargetLanguage(TranslateLanguage.INDONESIAN)
+                      .build()
+                  translator = Translation.getClient(options)
+                  translator?.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                      ?.addOnSuccessListener { Toast.makeText(this, "Kamus siap digunakan!", Toast.LENGTH_SHORT).show() }
+                      ?.addOnFailureListener { e -> Toast.makeText(this, "Gagal mengunduh kamus: ${e.message}", Toast.LENGTH_LONG).show() }
+              }
+
+              @SuppressLint("WrongConstant")
+              private fun initMediaProjection(resultCode: Int, resultData: Intent) {
+                  val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  mediaProjection = pm.getMediaProjection(resultCode, resultData)
+                  mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          super.onStop()
+                          virtualDisplay?.release()
+                          imageReader?.close()
+                      }
+                  }, mainHandler)
+                  imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
+                  virtualDisplay = mediaProjection?.createVirtualDisplay(
+                      "MangaScreenCapture", screenWidth, screenHeight, screenDensity,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, imageReader?.surface, null, mainHandler
+                  )
+              }
+
+              private fun setupOverlayCanvas() {
+                  overlayCanvasLayout = FrameLayout(this).apply {
+                      visibility = View.GONE
+                      setOnClickListener {
+                          removeAllViews()
+                          visibility = View.GONE
+                      }
+                  }
+                  val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                  val params = WindowManager.LayoutParams(
+                      screenWidth, screenHeight, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 0
+                      y = 0
+                  }
+                  windowManager.addView(overlayCanvasLayout, params)
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun setupFloatingButton() {
+                  val container = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(24, 16, 24, 16)
+                      background = GradientDrawable().apply {
+                          set
