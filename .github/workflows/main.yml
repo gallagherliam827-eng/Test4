@@ -1,0 +1,48 @@
+name: Build APK dari ZIP
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Ekstrak File ZIP dengan Struktur Folder Utuh
+        run: |
+          mkdir -p _build_dir
+          cp *.zip _build_dir/
+          cd _build_dir
+          for z in *.zip; do
+            unzip -q -o "$z"
+            rm -f "$z"
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Rakit Debug APK
+        run: |
+          cd _build_dir
+          SETTINGS_FILE=$(find . -maxdepth 3 -name "settings.gradle*" | head -n 1)
+          cd "$(dirname "$SETTINGS_FILE")"
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+          gradle assembleDebug --no-daemon
+
+      - name: Upload APK Siap Install
+        uses: actions/upload-artifact@v4
+        with:
+          name: MangaTranslator-APK
+          path: _build_dir/**/build/outputs/apk/debug/*.apk
+          
